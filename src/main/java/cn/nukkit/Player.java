@@ -23,7 +23,6 @@ import cn.nukkit.entity.mob.EntityWolf;
 import cn.nukkit.entity.passive.EntityHappyGhast;
 import cn.nukkit.entity.passive.EntityVillager;
 import cn.nukkit.entity.projectile.EntityArrow;
-import cn.nukkit.entity.projectile.EntityProjectile;
 import cn.nukkit.entity.projectile.EntityThrownTrident;
 import cn.nukkit.event.block.WaterFrostEvent;
 import cn.nukkit.event.entity.*;
@@ -73,6 +72,7 @@ import cn.nukkit.network.SourceInterface;
 import cn.nukkit.network.encryption.PrepareEncryptionTask;
 import cn.nukkit.network.process.DataPacketManager;
 import cn.nukkit.network.protocol.*;
+import cn.nukkit.network.protocol.netease.NeteaseJsonPacket;
 import cn.nukkit.network.protocol.netease.PyRpcPacket;
 import cn.nukkit.network.protocol.netease.pyrpc.PyRpcSubPacket;
 import cn.nukkit.network.protocol.types.*;
@@ -103,6 +103,7 @@ import com.google.common.cache.Cache;
 import com.google.common.cache.CacheBuilder;
 import com.google.common.collect.BiMap;
 import com.google.common.collect.HashBiMap;
+import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 import it.unimi.dsi.fastutil.ints.Int2ObjectOpenHashMap;
 import it.unimi.dsi.fastutil.ints.IntOpenHashSet;
@@ -299,6 +300,12 @@ public class Player extends EntityHuman implements CommandSender, InventoryHolde
     private boolean hasSpawnChunks;
     protected final LongLinkedOpenHashSet loadQueue = new LongLinkedOpenHashSet();
     protected int nextChunkOrderRun = 1;
+    // 供 checkNetwork 检测跨区块/转向即时重排 / For checkNetwork cross-chunk/turn instant reorder
+    private int lastOrderChunkX = Integer.MIN_VALUE;
+    private int lastOrderChunkZ = Integer.MIN_VALUE;
+    private double lastOrderYaw = Double.NaN;
+    // 借鉴 PNX,默认 100° / Adapted from PNX, default 100°
+    private static final double FOV_DEGREES = 100.0;
 
     protected final Map<UUID, Player> hiddenPlayers = new HashMap<>();
 
@@ -1272,11 +1279,9 @@ public class Player extends EntityHuman implements CommandSender, InventoryHolde
                     }
 
                     if (!this.level.populateChunk(chunkX, chunkZ)) {
-                        if (this.spawned && this.teleportPosition == null) {
-                            continue;
-                        } else {
-                            break;
-                        }
+                        // 保中心向外顺序,避免外圈幽灵区块(等价 Allay enqueueFirst+break)
+                        // Preserve center-out order, avoiding ghost chunks (cf. Allay enqueueFirst+break)
+                        break;
                     }
 
                     iter.remove();
@@ -1382,6 +1387,8 @@ public class Player extends EntityHuman implements CommandSender, InventoryHolde
 
         this.spawned = true;
 
+        this.sendMovementSpeed();
+
         if (this.protocol < ProtocolInfo.v1_2_0) {
             this.sendAllInventories();
             this.inventory.sendHeldItemIfNotAir(this);
@@ -1417,6 +1424,10 @@ public class Player extends EntityHuman implements CommandSender, InventoryHolde
         this.sendFogStack();
         this.sendCameraPresets();
 
+        if (this.canUseNetEaseModApi()) {
+            this.sendNetEaseLevelGravityReset();
+        }
+
         if (server.updateChecks && this.isOp()) {
             CompletableFuture.runAsync(() -> {
                 try {
@@ -1443,6 +1454,9 @@ public class Player extends EntityHuman implements CommandSender, InventoryHolde
         }
 
         this.nextChunkOrderRun = 20;
+        this.lastOrderChunkX = (int) this.x >> 4;
+        this.lastOrderChunkZ = (int) this.z >> 4;
+        this.lastOrderYaw = this.yaw;
 
         loadQueue.clear();
         Long2ObjectOpenHashMap<Boolean> lastChunk = new Long2ObjectOpenHashMap<>(this.usedChunks);
@@ -1453,6 +1467,14 @@ public class Player extends EntityHuman implements CommandSender, InventoryHolde
         int radius = spawned ? this.chunkRadius : server.c_s_spawnThreshold;
         int radiusSqr = radius * radius;
 
+        // FOV 朝向优先(借鉴 PNX):视野内先入队,组内近→远;LongLinkedOpenHashSet 保插入序
+        // FOV direction priority (PNX): in-FOV first, near-to-far within group; LongLinkedOpenHashSet keeps order
+        double dirX = -Math.sin(Math.toRadians(this.yaw));
+        double dirZ = Math.cos(Math.toRadians(this.yaw));
+        double cosFov = Math.cos(Math.toRadians(FOV_DEGREES));
+        LongArrayList inFov = new LongArrayList();
+        LongArrayList outFov = new LongArrayList();
+
         long index;
         for (int x = 0; x <= radius; x++) {
             int xx = x * x;
@@ -1461,49 +1483,36 @@ public class Player extends EntityHuman implements CommandSender, InventoryHolde
                 if (distanceSqr > radiusSqr) continue;
 
                 /* Top right quadrant */
-                if (this.usedChunks.get(index = Level.chunkHash(centerX + x, centerZ + z)) != Boolean.TRUE) {
-                    this.loadQueue.add(index);
-                }
-                lastChunk.remove(index);
+                index = Level.chunkHash(centerX + x, centerZ + z);
+                this.classifyChunkForFov(index, x, z, dirX, dirZ, cosFov, inFov, outFov, lastChunk);
                 /* Top left quadrant */
-                if (this.usedChunks.get(index = Level.chunkHash(centerX - x - 1, centerZ + z)) != Boolean.TRUE) {
-                    this.loadQueue.add(index);
-                }
-                lastChunk.remove(index);
+                index = Level.chunkHash(centerX - x - 1, centerZ + z);
+                this.classifyChunkForFov(index, -x - 1, z, dirX, dirZ, cosFov, inFov, outFov, lastChunk);
                 /* Bottom right quadrant */
-                if (this.usedChunks.get(index = Level.chunkHash(centerX + x, centerZ - z - 1)) != Boolean.TRUE) {
-                    this.loadQueue.add(index);
-                }
-                lastChunk.remove(index);
+                index = Level.chunkHash(centerX + x, centerZ - z - 1);
+                this.classifyChunkForFov(index, x, -z - 1, dirX, dirZ, cosFov, inFov, outFov, lastChunk);
                 /* Bottom left quadrant */
-                if (this.usedChunks.get(index = Level.chunkHash(centerX - x - 1, centerZ - z - 1)) != Boolean.TRUE) {
-                    this.loadQueue.add(index);
-                }
-                lastChunk.remove(index);
+                index = Level.chunkHash(centerX - x - 1, centerZ - z - 1);
+                this.classifyChunkForFov(index, -x - 1, -z - 1, dirX, dirZ, cosFov, inFov, outFov, lastChunk);
                 if (x != z) {
                     /* Top right quadrant mirror */
-                    if (this.usedChunks.get(index = Level.chunkHash(centerX + z, centerZ + x)) != Boolean.TRUE) {
-                        this.loadQueue.add(index);
-                    }
-                    lastChunk.remove(index);
+                    index = Level.chunkHash(centerX + z, centerZ + x);
+                    this.classifyChunkForFov(index, z, x, dirX, dirZ, cosFov, inFov, outFov, lastChunk);
                     /* Top left quadrant mirror */
-                    if (this.usedChunks.get(index = Level.chunkHash(centerX - z - 1, centerZ + x)) != Boolean.TRUE) {
-                        this.loadQueue.add(index);
-                    }
-                    lastChunk.remove(index);
+                    index = Level.chunkHash(centerX - z - 1, centerZ + x);
+                    this.classifyChunkForFov(index, -z - 1, x, dirX, dirZ, cosFov, inFov, outFov, lastChunk);
                     /* Bottom right quadrant mirror */
-                    if (this.usedChunks.get(index = Level.chunkHash(centerX + z, centerZ - x - 1)) != Boolean.TRUE) {
-                        this.loadQueue.add(index);
-                    }
-                    lastChunk.remove(index);
+                    index = Level.chunkHash(centerX + z, centerZ - x - 1);
+                    this.classifyChunkForFov(index, z, -x - 1, dirX, dirZ, cosFov, inFov, outFov, lastChunk);
                     /* Bottom left quadrant mirror */
-                    if (this.usedChunks.get(index = Level.chunkHash(centerX - z - 1, centerZ - x - 1)) != Boolean.TRUE) {
-                        this.loadQueue.add(index);
-                    }
-                    lastChunk.remove(index);
+                    index = Level.chunkHash(centerX - z - 1, centerZ - x - 1);
+                    this.classifyChunkForFov(index, -z - 1, -x - 1, dirX, dirZ, cosFov, inFov, outFov, lastChunk);
                 }
             }
         }
+
+        for (long l : inFov) this.loadQueue.add(l);
+        for (long l : outFov) this.loadQueue.add(l);
 
         LongIterator keys = lastChunk.keySet().iterator();
         while (keys.hasNext()) {
@@ -1521,6 +1530,33 @@ public class Player extends EntityHuman implements CommandSender, InventoryHolde
         }
 
         return true;
+    }
+
+    private void classifyChunkForFov(long index, int dx, int dz, double dirX, double dirZ, double cosFov,
+                                     LongArrayList inFov, LongArrayList outFov, Long2ObjectOpenHashMap<Boolean> lastChunk) {
+        if (this.usedChunks.get(index) != Boolean.TRUE) {
+            if (isChunkInFov(dx, dz, dirX, dirZ, cosFov)) {
+                inFov.add(index);
+            } else {
+                outFov.add(index);
+            }
+        }
+        lastChunk.remove(index);
+    }
+
+    /**
+     * 视野锥判定(借鉴 PNX);近距离(&lt;4)强制视野内防抖动。
+     * <p>
+     * FOV cone test (PNX); &lt;4 chunks forced in-FOV to avoid jitter.
+     */
+    private static boolean isChunkInFov(int dx, int dz, double dirX, double dirZ, double cosFov) {
+        long distSq = (long) dx * dx + (long) dz * dz;
+        if (distSq < 16) {
+            return true;
+        }
+        double len = Math.sqrt(distSq);
+        double dot = dirX * (dx / len) + dirZ * (dz / len);
+        return dot >= cosFov;
     }
 
     @Deprecated
@@ -2677,7 +2713,7 @@ public class Player extends EntityHuman implements CommandSender, InventoryHolde
         pk.entries = new Attribute[]{
                 Attribute.getAttribute(Attribute.MAX_HEALTH).setMaxValue(this.getMaxHealth()).setValue(health > 0 ? (health < getMaxHealth() ? health : getMaxHealth()) : 0),
                 Attribute.getAttribute(Attribute.MAX_HUNGER).setValue(this.foodData.getLevel()).setDefaultValue(this.foodData.getMaxLevel()),
-                Attribute.getAttribute(Attribute.MOVEMENT_SPEED).setValue(this.getMovementSpeed()).setDefaultValue(this.getMovementSpeed()),
+                Attribute.getAttribute(Attribute.MOVEMENT_SPEED).setValue(this.speedToSend).setDefaultValue(this.getMovementSpeed()),
                 Attribute.getAttribute(Attribute.EXPERIENCE_LEVEL).setValue(this.expLevel),
                 Attribute.getAttribute(Attribute.EXPERIENCE).setValue(((float) this.exp) / calculateRequireExperience(this.expLevel))
         };
@@ -2696,6 +2732,21 @@ public class Player extends EntityHuman implements CommandSender, InventoryHolde
         }
         CameraPresetsPacket pk = new CameraPresetsPacket();
         pk.getPresets().addAll(CameraPresetManager.getPresets().values());
+        this.dataPacket(pk);
+    }
+
+    /**
+     * 下发 SET_LEVEL_GRAVITY 消息（NeteaseJsonPacket），将客户端世界重力重置为原版默认 -0.08。
+     * <p>
+     * Sends a SET_LEVEL_GRAVITY message (NeteaseJsonPacket) resetting the client's
+     * level gravity to the vanilla default of -0.08 (negative pulls down).
+     */
+    private void sendNetEaseLevelGravityReset() {
+        JsonObject payload = new JsonObject();
+        payload.addProperty("eventName", NeteaseJsonPacket.EVENT_SET_LEVEL_GRAVITY);
+        payload.addProperty("gravity", -0.08f);
+        NeteaseJsonPacket pk = new NeteaseJsonPacket();
+        pk.json = payload.toString();
         this.dataPacket(pk);
     }
 
@@ -3045,7 +3096,15 @@ public class Player extends EntityHuman implements CommandSender, InventoryHolde
         nowLevel.providerLock.readLock().lock();
 
         try {
-            if (this.nextChunkOrderRun-- <= 0 || this.chunk == null) {
+            int curChunkX = (int) this.x >> 4;
+            int curChunkZ = (int) this.z >> 4;
+            // 跨区块或转向>45° 立即重排(等价 PNX),不等 nextChunkOrderRun
+            // Reorder on cross-chunk or turn>45° (cf. PNX), not waiting for nextChunkOrderRun
+            boolean crossedChunk = curChunkX != this.lastOrderChunkX || curChunkZ != this.lastOrderChunkZ;
+            double yawDelta = this.yaw - this.lastOrderYaw;
+            yawDelta = ((yawDelta + 180) % 360 + 360) % 360 - 180;   // 归一到 [-180,180) / wrap to [-180,180)
+            boolean turned = !Double.isNaN(this.lastOrderYaw) && Math.abs(yawDelta) > 45.0;
+            if (this.nextChunkOrderRun-- <= 0 || this.chunk == null || crossedChunk || turned) {
                 this.orderChunks();
             }
 
@@ -6849,7 +6908,7 @@ public class Player extends EntityHuman implements CommandSender, InventoryHolde
 
         this.sendData(this);
 
-        this.recalculateMovementSpeed();
+        this.setMovementSpeed(DEFAULT_SPEED);
 
         this.adventureSettings.update();
         this.inventory.sendContents(this);
@@ -6966,8 +7025,43 @@ public class Player extends EntityHuman implements CommandSender, InventoryHolde
         this.dataPacket(pk);
     }
 
+    @Override
+    public void setMovementSpeed(float speed) {
+        setMovementSpeed(speed, true);
+    }
+
+    /**
+     * 设置玩家基础移动速度，修饰符（疾跑、药水等）叠加在该基础值之上。
+     * <p>
+     * Sets the player's base movement speed; modifiers (sprinting, effects, etc.) apply on top of it.
+     *
+     * @param speed 基础移动速度，默认为 {@link #DEFAULT_SPEED} / Base movement speed, defaults to {@link #DEFAULT_SPEED}
+     * @param send  是否向客户端发送更新后的速度属性 / Whether to send the updated speed attribute to the client
+     */
+    public void setMovementSpeed(float speed, boolean send) {
+        if (speed < 0 || !Float.isFinite(speed)) {
+            server.getLogger().debug("Invalid setMovementSpeed: " + speed);
+            return;
+        }
+        super.setMovementSpeed(speed);
+        this.speedToSend = this.recalculateMovementSpeedToSend();
+        if (this.spawned && send) {
+            this.sendMovementSpeed();
+        }
+    }
+
+    /**
+     * 仅重算发送给客户端的速度，不改动基础速度字段。
+     * <p>
+     * Recomputes the client-bound speed only, leaving the base speed field untouched.
+     */
+    @Override
+    public void recalculateMovementSpeed() {
+        this.speedToSend = this.recalculateMovementSpeedToSend();
+    }
+
     public void sendMovementSpeed() {
-        Attribute attribute = Attribute.getAttribute(Attribute.MOVEMENT_SPEED).setValue(speedToSend);
+        Attribute attribute = Attribute.getAttribute(Attribute.MOVEMENT_SPEED).setValue(speedToSend).setDefaultValue(this.getMovementSpeed());
         this.setAttribute(attribute);
     }
 
@@ -7330,12 +7424,14 @@ public class Player extends EntityHuman implements CommandSender, InventoryHolde
                 this.dataPacket(pk);
             }
 
-            this.forceMovement = this.getLocation();
+            this.teleportPosition = this.getLocation();
+            this.forceMovement = this.teleportPosition.clone();
             this.sendPosition(this.forceMovement, MovePlayerPacket.MODE_RESET);
 
             this.resetFallDistance();
             this.orderChunks();
             this.nextChunkOrderRun = 0;
+            this.checkTeleportPosition();
             this.resetClientMovement();
 
             this.setSwimming(false);
@@ -8107,28 +8203,27 @@ public class Player extends EntityHuman implements CommandSender, InventoryHolde
             }
             if (entity instanceof EntityThrownTrident) {
                 // Check Trident is returning to shooter
-                if (!((EntityThrownTrident) entity).hadCollision) {
-                    if (entity.isNoClip()) {
-                        if (!((EntityProjectile) entity).shootingEntity.equals(this)) {
-                            return false;
-                        }
-                    } else {
+                EntityThrownTrident thrownTrident = (EntityThrownTrident) entity;
+                if (thrownTrident.isNoClip()) {
+                    if (thrownTrident.shootingEntity == null || !thrownTrident.shootingEntity.equals(this)) {
                         return false;
                     }
-                }
-
-                if (!((EntityThrownTrident) entity).isPlayer()) {
+                } else if (!thrownTrident.hadCollision) {
                     return false;
                 }
 
-                Item item = ((EntityThrownTrident) entity).getItem();
+                if (!thrownTrident.isPlayer()) {
+                    return false;
+                }
+
+                Item item = thrownTrident.getItem();
                 if (!this.isCreative() && !this.inventory.canAddItem(item)) {
                     return false;
                 }
 
-                InventoryPickupTridentEvent ev = new InventoryPickupTridentEvent(this.inventory, (EntityThrownTrident) entity);
+                InventoryPickupTridentEvent ev = new InventoryPickupTridentEvent(this.inventory, thrownTrident);
 
-                int pickupMode = ((EntityThrownTrident) entity).getPickupMode();
+                int pickupMode = thrownTrident.getPickupMode();
                 if (pickupMode == EntityThrownTrident.PICKUP_NONE || (pickupMode == EntityThrownTrident.PICKUP_CREATIVE && !this.isCreative())) {
                     ev.setCancelled();
                 }
@@ -8144,9 +8239,9 @@ public class Player extends EntityHuman implements CommandSender, InventoryHolde
                 Server.broadcastPacket(entity.getViewers().values(), pk);
                 this.dataPacket(pk);
 
-                if (!((EntityThrownTrident) entity).isCreative()) {
-                    if (inventory.getItem(((EntityThrownTrident) entity).getFavoredSlot()).getId() == Item.AIR) {
-                        inventory.setItem(((EntityThrownTrident) entity).getFavoredSlot(), item.clone());
+                if (!thrownTrident.isCreative()) {
+                    if (inventory.getItem(thrownTrident.getFavoredSlot()).getId() == Item.AIR) {
+                        inventory.setItem(thrownTrident.getFavoredSlot(), item.clone());
                     } else {
                         inventory.addItem(item.clone());
                     }
@@ -8953,7 +9048,7 @@ public class Player extends EntityHuman implements CommandSender, InventoryHolde
     }
 
     public float recalculateMovementSpeedToSend() {
-        float newMovementSpeed = DEFAULT_SPEED;
+        float newMovementSpeed = this.getMovementSpeed();
         for (EntityMovementSpeedModifier modifier : this.getMovementSpeedModifiers().values()) {
             if (modifier.isSend()) {
                 float value = modifier.getValue();
